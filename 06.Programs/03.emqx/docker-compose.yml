@@ -1,0 +1,32 @@
+# EMQX MQTT broker for Bay 11 (MES / SCADA <-> Node-RED gateway).
+# The Node-RED flow connects to it on 1883 (MQTT 3.1.1, no auth).
+#
+#   docker compose -f emqx/docker-compose.yml up -d
+#
+# On a fresh host, give the data/log folders to the container user (uid 1000)
+# first, or EMQX can't write to them: see README.md.
+services:
+  emqx:
+    image: emqx/emqx-enterprise:6.1.1
+    container_name: emqx
+    hostname: vc-mqtt             # so the node name below resolves inside the container
+    restart: unless-stopped
+    ports:
+      - "1883:1883"               # MQTT
+      - "8883:8883"               # MQTT over TLS
+      - "8083:8083"               # WebSocket
+      - "8084:8084"               # WSS (WebSocket over TLS)
+      - "18083:18083"             # Dashboard
+    environment:
+      # Node name = EMQX_NAME@EMQX_HOST (vflow-emqx@vc-mqtt). The data directory
+      # is tied to it, so don't change these on a broker that already has data.
+      EMQX_NAME: vflow-emqx
+      EMQX_HOST: vc-mqtt
+    volumes:
+      - ./emqx_data:/opt/emqx/data  # config changes made in the dashboard, retained messages, sessions
+      - ./emqx_log:/opt/emqx/log
+    healthcheck:
+      test: ["CMD", "/opt/emqx/bin/emqx", "ctl", "status"]
+      interval: 5s
+      timeout: 25s
+      retries: 5

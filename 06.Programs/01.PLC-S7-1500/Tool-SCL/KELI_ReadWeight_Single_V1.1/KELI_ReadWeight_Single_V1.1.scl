@@ -1,0 +1,666 @@
+﻿//===============================================================================
+// KELI_ReadWeight - Đọc khối lượng GROSS của đầu cân KELI D2008 qua MODBUS (TF = 1)
+// PLC: S7-1200 / S7-1500 + module CM RS485 (Freeport, dùng Send_P2P / Receive_P2P)
+//-------------------------------------------------------------------------------
+// CÀI ĐẶT ĐẦU CÂN: tF = 1 (MODBUS command), Adr = địa chỉ 1..247, bt = baudrate, jn = parity
+// CÀI ĐẶT CỔNG CM (Port configuration):
+//   - Baudrate / parity / 8 data bit / 1 stop bit: giống đầu cân
+//   - Message end (Receive): "Recognize end of message by line idle time"
+//     (đầu cân nghỉ >= 4 ký tự sau mỗi khung -> CM báo đã nhận đủ khung)
+//
+// KHUNG TIN (theo manual D2008, mục MODBUS command mode):
+//   Lệnh gửi (requestFrame, 8 byte):
+//     [0] địa chỉ  [1] 16#03  [2] 16#00  [3] 16#01  [4] 16#00  [5] 16#04  [6] CRC low  [7] CRC high
+//     ví dụ địa chỉ 1: 16#01 03 00 01 00 04 15 C9
+//   Phản hồi bình thường (13 byte):
+//     [0] địa chỉ  [1] 16#03  [2] 16#08 (= 8 byte dữ liệu)
+//     [3] dấu: '0' (16#30) = dương, '-' = âm  [4..9] 6 chữ số ASCII (Data5..Data0)  [10] số chữ số thập phân
+//     [11] CRC low  [12] CRC high
+//     ví dụ 20.00 kg: '0' '0' '0' '2' '0' '0' '0' '2' -> weight = 2000, decimals = 2
+//   Phản hồi lỗi (exception, 5 byte): [0] địa chỉ  [1] 16#83  [2] mã exception  [3] CRC L  [4] CRC H
+//
+// CRC16 MODBUS: giá trị đầu 16#FFFF, đa thức 16#A001, tính trên mọi byte trừ 2 byte CRC,
+//   gửi byte thấp trước, byte cao sau.
+//
+// OUTPUT GIÁ TRỊ CÂN:
+//   weight    : khối lượng dạng số nguyên, có dấu, KHÔNG có dấu thập phân (vd 2000)
+//   decimals  : số chữ số sau dấu thập phân (vd 2  ->  khối lượng thật = 2000 / 10^2 = 20.00)
+//   weightRaw : chuỗi 8 ký tự đầu cân gửi về, đúng nguyên bản (vd '00020002')
+//
+// status : 0 = BAD (lỗi), 1 = GOOD (đọc tốt), 2 = UNCERTAIN (chưa có giá trị / đang retry)
+//
+// TỰ KHỞI ĐỘNG LẠI: autoRestart = TRUE -> sau khi báo lỗi, FB chờ restartDelay rồi
+//   tự chạy lại từ đầu, không cần sườn lên ở execute. restartCount đếm số lần tự chạy lại.
+//   resetRestartCount (IN_OUT): SCADA/HMI ghi TRUE -> restartCount = 0, FB tự trả tag về FALSE.
+//     Nối vào 1 tag Bool trong DB (vd "HMI".resetRestartCount_Can1), không nối hằng số.
+//
+// [V1.1] ĐO THỜI GIAN PHẢN HỒI CỦA ĐẦU CÂN (timer độ phân giải 1 ms):
+//   Bắt đầu đếm : khi FB bắt đầu gửi lệnh xuống đầu cân (vào bước 20 - SEND)
+//   Kết thúc    : khi CM báo đã nhận xong khung trả lời (Receive_P2P.NDR ở bước 30)
+//   KHÔNG tính  : thời gian kiểm tra CRC và đổi ra số cân (bước 40)
+//   responseTime   : kết quả dạng Time (vd T#45MS)
+//   responseTimeMs : kết quả dạng số ms (vd 45) - tiện hiển thị trên HMI / SCADA
+//   Chỉ cập nhật khi nhận được khung; timeout / lỗi gửi -> giữ giá trị lần đo gần nhất.
+//   Mỗi lần retry đo lại từ đầu -> kết quả là thời gian của lần gửi nhận được trả lời.
+//   Lưu ý: FB chỉ thấy NDR khi được gọi, nên kết quả có thể lớn hơn thực tế tối đa 1 chu kỳ quét.
+//
+// BẢNG MÃ LỖI (errorCode) - subStatus cho biết thêm chi tiết:
+//   16#0000 ERR_NONE                không lỗi
+//   16#8101 ERR_PARAM_ADDRESS       requestFrame[0] không thuộc 1..247   sub = địa chỉ nhập
+//   16#8102 ERR_PARAM_FUNCTION      requestFrame[1] khác 16#03            sub = mã nhập
+//   16#8103 ERR_PARAM_REGISTER      thanh ghi khác 16#0001 (gross)        sub = thanh ghi nhập
+//   16#8104 ERR_PARAM_QUANTITY      số lượng khác 16#0004                 sub = số lượng nhập
+//   16#8105 ERR_PARAM_CRC           sai CRC trong requestFrame            sub = CRC ĐÚNG (L H) để sửa
+//   16#8201 ERR_RX_RESET            Receive_Reset lỗi                     sub = STATUS
+//   16#8202 ERR_SEND                Send_P2P lỗi (truyền xuống)           sub = STATUS
+//   16#8203 ERR_RECEIVE             Receive_P2P lỗi (nhận)                sub = STATUS
+//   16#8204 ERR_TIMEOUT             không có phản hồi
+//   16#8205 ERR_STATE_TIMEOUT       kẹt ở bước RX_RESET/SEND              sub = state
+//   16#8301 ERR_FRAME_TOO_SHORT     gói ngắn hơn 5 byte                   sub = độ dài
+//   16#8302 ERR_FRAME_ADDRESS       đầu cân khác trả lời                  sub = địa chỉ nhận
+//   16#8303 ERR_FRAME_FUNCTION      mã hàm trả về sai                     sub = mã nhận
+//   16#8304 ERR_FRAME_LENGTH        sai độ dài gói (phải 13 byte)         sub = độ dài
+//   16#8305 ERR_FRAME_BYTE_COUNT    byte [2] khác 16#08                   sub = byte nhận
+//   16#8401 ERR_CRC_MISMATCH        sai CRC gói nhận                      sub = CRC nhận (L H)
+//   16#8501 ERR_EXCEPTION           đầu cân trả exception (16#83)         sub = mã exception
+//   16#8601 ERR_WEIGHT_FORMAT       dấu / chữ số không hợp lệ             sub = vị trí byte lỗi
+//   16#8602 ERR_WEIGHT_OVERLOAD     đầu cân báo quá tải (999999)
+//   16#8603 ERR_DECIMAL_FORMAT      byte số thập phân không hợp lệ        sub = byte nhận
+//   16#8701 ERR_UNDEFINED_STATE     lỗi state nội bộ                      sub = state
+//   Có retry: 82xx, 83xx, 84xx. Không retry: 81xx, 85xx, 86xx, 8701.
+//
+// Bản 1 khối: CRC16 viết trực tiếp trong FB, không cần FC nào khác.
+//
+// LỊCH SỬ PHIÊN BẢN:
+//   V1.0 (2026-10-07): bản đầu tiên - đọc gross weight, byte dấu '0' = dương,
+//                      resetRestartCount dạng IN_OUT (FB tự trả về FALSE)
+//   V1.1 (2026-10-08): thêm đo thời gian phản hồi của đầu cân
+//                      (output responseTime, responseTimeMs; timer instResponseTimer)
+//===============================================================================
+
+FUNCTION_BLOCK "KELI_ReadWeight"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 1.1
+   VAR_INPUT
+      execute : Bool;                       // Sườn lên (0->1) = gửi 1 lệnh đọc
+      hardwareId : PORT;                    // HW identifier của cổng RS485 trên CM
+      requestFrame : Array[0..7] of Byte;   // Khung lệnh đọc gross: addr 03 00 01 00 04 CRC_L CRC_H
+      timeout : Time := T#1S;               // Thời gian chờ phản hồi tối đa
+      numberOfRetries : USInt := 2;         // Số lần gửi lại khi lỗi đường truyền/khung/CRC
+      autoRestart : Bool := TRUE;           // TRUE = tự chạy lại sau khi báo lỗi
+      restartDelay : Time := T#5S;          // Thời gian chờ trước khi tự chạy lại
+   END_VAR
+
+   VAR_IN_OUT
+      resetRestartCount : Bool;             // SCADA ghi TRUE = đưa restartCount về 0, FB tự trả về FALSE
+   END_VAR
+
+   VAR_OUTPUT
+      done : Bool;                          // TRUE = đọc thành công
+      busy : Bool;                          // TRUE = đang gửi / chờ phản hồi
+      error : Bool;                         // TRUE = lỗi (đã hết lượt retry)
+      status : USInt := 2;                  // 0 = BAD, 1 = GOOD, 2 = UNCERTAIN
+      errorCode : Word;                     // Mã lỗi, xem bảng ở đầu file
+      subStatus : Word;                     // Thông tin chi tiết của lỗi
+      weight : DInt;                        // Khối lượng số nguyên có dấu, không dấu thập phân
+      decimals : USInt;                     // Số chữ số thập phân (vị trí dấu '.' tính từ phải)
+      weightRaw : String[8];                // 8 ký tự dữ liệu gốc: dấu + 6 số + số thập phân
+      restartCount : UInt;                  // Số lần FB đã tự chạy lại sau lỗi (chẩn đoán)
+      responseTime : Time;                  // [V1.1] Thời gian từ lúc gửi lệnh đến lúc nhận xong khung (vd T#45MS)
+      responseTimeMs : DInt;                // [V1.1] Như responseTime nhưng dạng số ms (vd 45) cho HMI / SCADA
+   END_VAR
+
+   VAR
+      statState : Int;                      // Bước hiện tại của state machine (0/10/20/30/40)
+      statExecuteOld : Bool;                // Giá trị execute ở chu kỳ trước (bắt sườn lên)
+      statDone : Bool;                      // Bản trong của output done
+      statBusy : Bool;                      // Bản trong của output busy
+      statError : Bool;                     // Bản trong của output error
+      statStatus : USInt := 2;              // Bản trong của output status
+      statErrorCode : Word;                 // Bản trong của output errorCode
+      statSubStatus : Word;                 // Bản trong của output subStatus
+      statRetryCounter : USInt;             // Số lượt retry còn lại
+      statTxBuffer : Array[0..7] of Byte;   // Khung gửi (chép từ requestFrame lúc bắt đầu lệnh)
+      statTxLength : UInt := 8;             // Số byte cần gửi (= 8)
+      statRxBuffer : Array[0..63] of Byte;  // Khung nhận từ đầu cân
+      statRxLength : UInt;                  // Số byte nhận được
+      statCrcReceived : Word;               // CRC đầu cân gửi về, dạng (L H) (chẩn đoán)
+      statCrcCalculated : Word;             // CRC PLC tự tính, dạng (L H) (chẩn đoán)
+      statWeight : DInt;                    // Bản trong của output weight
+      statDecimals : USInt;                 // Bản trong của output decimals
+      statWeightRaw : String[8];            // Bản trong của output weightRaw
+      instRxReset : Receive_Reset;          // Lệnh Siemens: xóa bộ đệm nhận của CM
+      instSend : Send_P2P;                  // Lệnh Siemens: gửi khung tin
+      instReceive : Receive_P2P;            // Lệnh Siemens: nhận khung tin (kết thúc theo line idle)
+      instTimeout : TON_TIME;               // Timer chờ phản hồi
+      statRestartPending : Bool;            // TRUE = đã báo lỗi, đang chờ tự chạy lại
+      statRestartCount : UInt;              // Bản trong của output restartCount
+      instRestartTimer : TON_TIME;          // Timer đếm restartDelay trước khi tự chạy lại
+      instStateWatchdog : TON_TIME;         // Timer canh bước RX_RESET / SEND không bị kẹt
+      instResponseTimer : TON_TIME;         // [V1.1] Timer đo thời gian phản hồi (ET độ phân giải 1 ms)
+      statResponseTime : Time;              // [V1.1] Bản trong của output responseTime
+   END_VAR
+
+   VAR_TEMP
+      tempExecute : Bool;                   // Bản sao execute trong chu kỳ này
+      tempStartJob : Bool;                  // TRUE = bắt đầu lệnh mới (sườn lên hoặc tự chạy lại)
+      tempErrCode : Word;                   // Mã lỗi phát hiện trong chu kỳ này
+      tempSubStatus : Word;                 // Chi tiết lỗi trong chu kỳ này
+      tempRetryable : Bool;                 // TRUE = lỗi này được phép gửi lại
+      tempAddress : USInt;                  // Địa chỉ đầu cân lấy từ requestFrame[0]
+      tempRegister : Word;                  // Thanh ghi bắt đầu trong requestFrame (byte 2..3)
+      tempQuantity : Word;                  // Số lượng thanh ghi trong requestFrame (byte 4..5)
+      tempCrc : Word;                       // CRC16 đang tính
+      tempCrcLo : Byte;                     // Byte thấp của CRC tính được
+      tempCrcHi : Byte;                     // Byte cao của CRC tính được
+      tempBit : Int;                        // Biến đếm 8 bit khi tính CRC
+      tempLen : Int;                        // Độ dài gói nhận
+      tempIndex : Int;                      // Biến đếm vòng FOR
+      tempCode : USInt;                     // Mã ASCII của ký tự đang xét
+      tempValue : DInt;                     // Giá trị cân đang ghép từ các chữ số
+      tempNegative : Bool;                  // TRUE = dấu '-'
+      tempDigits : Int;                     // Số chữ số đã đọc
+      tempWeightOk : Bool;                  // FALSE = gặp ký tự không hợp lệ
+      tempBadIndex : Int;                   // Vị trí byte lỗi (ghi vào subStatus)
+      tempDecimals : USInt;                 // Số chữ số thập phân đọc từ byte [10]
+   END_VAR
+
+   VAR CONSTANT
+      // các bước của state machine
+      ST_IDLE : Int := 0;                   // chờ lệnh
+      ST_RX_RESET : Int := 10;              // xóa bộ đệm nhận
+      ST_SEND : Int := 20;                  // gửi lệnh
+      ST_WAIT_RESPONSE : Int := 30;         // chờ phản hồi
+      ST_PROCESS : Int := 40;               // phân tích gói nhận
+      // chất lượng dữ liệu (output status)
+      QUALITY_BAD : USInt := 0;
+      QUALITY_GOOD : USInt := 1;
+      QUALITY_UNCERTAIN : USInt := 2;
+      // MODBUS
+      FC_READ : Byte := 16#03;              // mã hàm đọc thanh ghi
+      FC_EXCEPTION : Byte := 16#83;         // mã hàm báo lỗi (16#03 + 16#80)
+      REG_GROSS : Word := 16#0001;          // thanh ghi gross weight
+      QTY_GROSS : Word := 16#0004;          // đọc 4 thanh ghi = 8 byte dữ liệu
+      BYTE_COUNT : Byte := 16#08;           // số byte dữ liệu trong phản hồi
+      ADDRESS_MIN : USInt := 1;
+      ADDRESS_MAX : USInt := 247;
+      CRC_INIT : Word := 16#FFFF;           // giá trị đầu CRC16 MODBUS
+      CRC_POLY : Word := 16#A001;           // đa thức CRC16 MODBUS (dạng đảo bit)
+      // độ dài khung (tính cả CRC)
+      LEN_MIN_FRAME : Int := 5;             // khung exception
+      LEN_WEIGHT_FRAME : Int := 13;         // khung giá trị cân
+      RX_BUFFER_SIZE : Int := 64;
+      RESPONSE_TIMER_PT : Time := T#1D;     // [V1.1] PT rất lớn: timer chỉ dùng ET để đo, không bao giờ chạy hết giờ
+      OVERLOAD_VALUE : DInt := 999999;      // đầu cân báo quá tải
+      DECIMALS_MAX : USInt := 5;            // 6 chữ số -> tối đa 5 số sau dấu '.'
+      // ký tự ASCII
+      CHR_ZERO : Byte := 16#30;             // 0  (đầu cân gửi ở byte dấu khi giá trị dương)
+      CHR_PLUS : Byte := 16#2B;             // +
+      CHR_MINUS : Byte := 16#2D;            // -
+      CHR_SPACE : Byte := 16#20;            // khoảng trắng
+      // mã lỗi (xem bảng ở đầu file)
+      ERR_NONE : Word := 16#0000;
+      ERR_PARAM_ADDRESS : Word := 16#8101;
+      ERR_PARAM_FUNCTION : Word := 16#8102;
+      ERR_PARAM_REGISTER : Word := 16#8103;
+      ERR_PARAM_QUANTITY : Word := 16#8104;
+      ERR_PARAM_CRC : Word := 16#8105;
+      ERR_RX_RESET : Word := 16#8201;
+      ERR_SEND : Word := 16#8202;
+      ERR_RECEIVE : Word := 16#8203;
+      ERR_TIMEOUT : Word := 16#8204;
+      ERR_STATE_TIMEOUT : Word := 16#8205;
+      ERR_FRAME_TOO_SHORT : Word := 16#8301;
+      ERR_FRAME_ADDRESS : Word := 16#8302;
+      ERR_FRAME_FUNCTION : Word := 16#8303;
+      ERR_FRAME_LENGTH : Word := 16#8304;
+      ERR_FRAME_BYTE_COUNT : Word := 16#8305;
+      ERR_CRC_MISMATCH : Word := 16#8401;
+      ERR_EXCEPTION : Word := 16#8501;
+      ERR_WEIGHT_FORMAT : Word := 16#8601;
+      ERR_WEIGHT_OVERLOAD : Word := 16#8602;
+      ERR_DECIMAL_FORMAT : Word := 16#8603;
+      ERR_UNDEFINED_STATE : Word := 16#8701;
+   END_VAR
+
+BEGIN
+	REGION Khởi tạo biến tạm cho chu kỳ này
+	    // Biến Temp không giữ giá trị giữa các chu kỳ quét -> đặt lại mỗi lần FB chạy.
+	    // Mặc định: không lỗi. Đoạn nào phát hiện lỗi sẽ gán tempErrCode,
+	    // phần "Xử lý lỗi / retry" ở cuối FB sẽ xử lý chung.
+	    #tempExecute := #execute;
+	    #tempErrCode := #ERR_NONE;
+	    #tempSubStatus := 16#0000;
+	    #tempRetryable := FALSE;
+	END_REGION
+
+	REGION Tự khởi động lại sau lỗi / canh bước bị kẹt
+	    // Watchdog: bước xóa bộ đệm (RX_RESET) và bước gửi (SEND) bình thường xong rất nhanh.
+	    // Nếu kẹt lâu hơn 'timeout' (lệnh Siemens không báo DONE cũng không báo ERROR)
+	    // thì phần "Watchdog hết giờ" bên dưới sẽ báo lỗi 16#8205 để FB thoát ra.
+	    #instStateWatchdog(IN := #statState = #ST_RX_RESET OR #statState = #ST_SEND, PT := #timeout);
+
+	    // [V1.1] Timer đo thời gian phản hồi: IN = TRUE suốt bước 20 (SEND) và 30 (WAIT_RESPONSE).
+	    //   - Vào bước 20 (bắt đầu gửi lệnh)  -> IN 0 -> 1 -> timer bắt đầu đếm từ 0 ms
+	    //   - Bước 20 -> 30                    -> IN vẫn = 1 -> timer đếm tiếp, không bị reset
+	    //   - Rời bước 30 (sang 40 / retry 10 / về 0) -> IN = 0 -> ET về 0, sẵn sàng lần đo sau
+	    //   Giá trị ET được chốt lại ở bước 30 đúng lúc Receive_P2P báo NDR (xem REGION 30).
+	    #instResponseTimer(IN := #statState = #ST_SEND OR #statState = #ST_WAIT_RESPONSE, PT := #RESPONSE_TIMER_PT);
+
+	    // Tự chạy lại: khi đã báo lỗi (statRestartPending = TRUE) và FB đang ở IDLE,
+	    // timer đếm 'restartDelay'. Hết giờ -> coi như có lệnh mới, chạy lại từ đầu.
+	    #instRestartTimer(IN := #autoRestart AND #statRestartPending AND #statState = #ST_IDLE, PT := #restartDelay);
+
+	    // Bắt đầu lệnh mới khi: có sườn lên ở execute HOẶC timer tự chạy lại hết giờ
+	    #tempStartJob := (#tempExecute AND NOT #statExecuteOld) OR #instRestartTimer.Q;
+
+	    IF #tempStartJob AND #statState = #ST_IDLE THEN
+	        // đếm số lần tự chạy lại (để biết trên HMI đường truyền có hay lỗi không)
+	        IF #instRestartTimer.Q AND #statRestartCount < 65535 THEN
+	            #statRestartCount := #statRestartCount + 1;
+	        END_IF;
+	        #statRestartPending := FALSE;
+	        // đưa các lệnh truyền thông về trạng thái ban đầu (REQ = FALSE)
+	        // để lần gọi REQ = TRUE tiếp theo chắc chắn có sườn lên
+	        #instRxReset(REQ := FALSE, PORT := #hardwareId);
+	        #instSend(REQ := FALSE, PORT := #hardwareId, BUFFER := #statTxBuffer, LENGTH := #statTxLength);
+	        #instTimeout(IN := FALSE, PT := #timeout);
+	    END_IF;
+
+	    // Reset bộ đếm số lần tự chạy lại: SCADA ghi resetRestartCount = TRUE
+	    // -> restartCount = 0, rồi FB tự ghi resetRestartCount = FALSE (tag ở PLC tự nhả,
+	    // SCADA không cần ghi FALSE). Đặt sau đoạn tăng bộ đếm để lệnh reset luôn được ưu tiên.
+	    IF #resetRestartCount THEN
+	        #statRestartCount := 0;
+	        #resetRestartCount := FALSE;
+	    END_IF;
+	END_REGION
+
+	// ===== STATE MACHINE: mỗi chu kỳ chỉ chạy 1 nhánh theo giá trị statState =====
+	CASE #statState OF
+	    #ST_IDLE:
+	        REGION 0 - IDLE: chờ lệnh, chép và kiểm tra khung gửi
+	            IF #tempStartJob THEN
+	                // có lệnh mới -> xóa kết quả của lần trước
+	                #statDone := FALSE;
+	                #statError := FALSE;
+
+	                // chép requestFrame vào buffer gửi của FB: nếu requestFrame bị đổi
+	                // trong lúc đang chạy thì khung đang gửi / dùng để so sánh vẫn không đổi
+	                FOR #tempIndex := 0 TO 7 DO
+	                    #statTxBuffer[#tempIndex] := #requestFrame[#tempIndex];
+	                END_FOR;
+
+	                // ghép 2 byte thành 1 Word: byte cao dịch trái 8 bit rồi OR byte thấp
+	                // ví dụ 16#00, 16#01 -> 16#0001
+	                #tempAddress := BYTE_TO_USINT(#statTxBuffer[0]);
+	                #tempRegister := SHL(IN := BYTE_TO_WORD(#statTxBuffer[2]), N := 8) OR BYTE_TO_WORD(#statTxBuffer[3]);
+	                #tempQuantity := SHL(IN := BYTE_TO_WORD(#statTxBuffer[4]), N := 8) OR BYTE_TO_WORD(#statTxBuffer[5]);
+
+	                REGION Kiểm tra nội dung requestFrame
+	                    // Kiểm tra lần lượt, gặp lỗi đầu tiên thì dừng (chuỗi IF..ELSIF).
+	                    IF #tempAddress < #ADDRESS_MIN OR #tempAddress > #ADDRESS_MAX THEN
+	                        // địa chỉ MODBUS phải 1..247
+	                        #tempErrCode := #ERR_PARAM_ADDRESS;
+	                        #tempSubStatus := USINT_TO_WORD(#tempAddress);
+
+	                    ELSIF #statTxBuffer[1] <> #FC_READ THEN
+	                        // chỉ hỗ trợ mã hàm 16#03
+	                        #tempErrCode := #ERR_PARAM_FUNCTION;
+	                        #tempSubStatus := BYTE_TO_WORD(#statTxBuffer[1]);
+
+	                    ELSIF #tempRegister <> #REG_GROSS THEN
+	                        // FB này chỉ đọc gross weight (thanh ghi 16#0001)
+	                        #tempErrCode := #ERR_PARAM_REGISTER;
+	                        #tempSubStatus := #tempRegister;
+
+	                    ELSIF #tempQuantity <> #QTY_GROSS THEN
+	                        // gross weight cần đọc đúng 4 thanh ghi (8 byte)
+	                        #tempErrCode := #ERR_PARAM_QUANTITY;
+	                        #tempSubStatus := #tempQuantity;
+	                    END_IF;
+	                END_REGION
+
+	                REGION Kiểm tra CRC của requestFrame
+	                    IF #tempErrCode = #ERR_NONE THEN
+	                        // --- tính CRC16 MODBUS trên 6 byte đầu (byte 0..5) ---
+	                        #tempCrc := #CRC_INIT;
+	                        FOR #tempIndex := 0 TO 5 DO
+	                            // XOR byte dữ liệu vào 8 bit thấp của CRC
+	                            #tempCrc := #tempCrc XOR BYTE_TO_WORD(#statTxBuffer[#tempIndex]);
+	                            // xử lý 8 bit: bit thấp nhất = 1 -> dịch phải rồi XOR đa thức,
+	                            //              bit thấp nhất = 0 -> chỉ dịch phải
+	                            FOR #tempBit := 1 TO 8 DO
+	                                IF (#tempCrc AND 16#0001) <> 16#0000 THEN
+	                                    #tempCrc := SHR(IN := #tempCrc, N := 1) XOR #CRC_POLY;
+	                                ELSE
+	                                    #tempCrc := SHR(IN := #tempCrc, N := 1);
+	                                END_IF;
+	                            END_FOR;
+	                        END_FOR;
+	                        #tempCrcLo := WORD_TO_BYTE(#tempCrc);                     // 8 bit thấp
+	                        #tempCrcHi := WORD_TO_BYTE(SHR(IN := #tempCrc, N := 8));  // 8 bit cao
+
+	                        // khung đúng: byte 6 = CRC low, byte 7 = CRC high
+	                        IF #statTxBuffer[6] <> #tempCrcLo OR #statTxBuffer[7] <> #tempCrcHi THEN
+	                            #tempErrCode := #ERR_PARAM_CRC;
+	                            // subStatus = CRC ĐÚNG theo thứ tự trong khung (L rồi H)
+	                            // ví dụ địa chỉ 1 -> 16#15C9 -> nhập byte 6 = 16#15, byte 7 = 16#C9
+	                            #tempSubStatus := SHL(IN := BYTE_TO_WORD(#tempCrcLo), N := 8) OR BYTE_TO_WORD(#tempCrcHi);
+	                        END_IF;
+	                    END_IF;
+	                END_REGION
+
+	                IF #tempErrCode = #ERR_NONE THEN
+	                    // khung hợp lệ -> nạp số lần retry, báo bận, chuyển sang bước xóa bộ đệm nhận
+	                    #statRetryCounter := #numberOfRetries;
+	                    #statBusy := TRUE;
+	                    #statState := #ST_RX_RESET;
+	                END_IF;
+
+	            ELSIF NOT #tempExecute THEN
+	                // done / error giữ TRUE chừng nào execute còn TRUE; execute = FALSE thì xóa
+	                #statDone := FALSE;
+	                #statError := FALSE;
+	            END_IF;
+	        END_REGION
+
+	    #ST_RX_RESET:
+	        REGION 10 - RX_RESET: xóa bộ đệm nhận của CM
+	            // Xóa rác / phản hồi cũ còn trong CM để gói nhận sau đó chắc chắn
+	            // là phản hồi của lệnh sắp gửi.
+	            #instRxReset(REQ := TRUE, PORT := #hardwareId);
+	            IF #instRxReset.DONE THEN
+	                #instRxReset(REQ := FALSE, PORT := #hardwareId);     // hạ REQ cho lần sau
+	                FILL_BLK(IN := 16#00, COUNT := 64, OUT => #statRxBuffer[0]); // xóa buffer nhận của FB
+	                #statRxLength := 0;
+	                #statState := #ST_SEND;
+	            ELSIF #instRxReset.ERROR THEN
+	                #tempErrCode := #ERR_RX_RESET;                        // lỗi 16#8201
+	                #tempSubStatus := #instRxReset.STATUS;                // mã lỗi Siemens
+	                #tempRetryable := TRUE;
+	                #instRxReset(REQ := FALSE, PORT := #hardwareId);
+	            END_IF;
+	        END_REGION
+
+	    #ST_SEND:
+	        REGION 20 - SEND: gửi khung lệnh xuống đầu cân
+	            // REQ giữ TRUE đến khi Send_P2P báo DONE hoặc ERROR
+	            #instSend(REQ := TRUE, PORT := #hardwareId, BUFFER := #statTxBuffer, LENGTH := #statTxLength);
+	            IF #instSend.DONE THEN
+	                // gửi xong -> hạ REQ, reset timer timeout, chuyển sang chờ phản hồi
+	                #instSend(REQ := FALSE, PORT := #hardwareId, BUFFER := #statTxBuffer, LENGTH := #statTxLength);
+	                #instTimeout(IN := FALSE, PT := #timeout);
+	                #statState := #ST_WAIT_RESPONSE;
+	            ELSIF #instSend.ERROR THEN
+	                #tempErrCode := #ERR_SEND;                            // lỗi 16#8202
+	                #tempSubStatus := #instSend.STATUS;
+	                #tempRetryable := TRUE;
+	                #instSend(REQ := FALSE, PORT := #hardwareId, BUFFER := #statTxBuffer, LENGTH := #statTxLength);
+	            END_IF;
+	        END_REGION
+
+	    #ST_WAIT_RESPONSE:
+	        REGION 30 - WAIT_RESPONSE: chờ phản hồi từ đầu cân
+	            // Receive_P2P báo NDR khi CM nhận xong 1 khung
+	            // (khung kết thúc khi đường truyền nghỉ - cấu hình 'line idle time' trong cổng CM).
+	            #instReceive(PORT := #hardwareId, BUFFER := #statRxBuffer);
+	            #instTimeout(IN := TRUE, PT := #timeout);
+
+	            IF #instReceive.NDR THEN
+	                // [V1.1] Chốt thời gian phản hồi NGAY khi nhận xong khung, trước khi phân tích:
+	                //   gọi lại timer (IN vẫn TRUE) để ET được cập nhật đến đúng thời điểm này,
+	                //   rồi lưu ET -> thời gian kiểm tra CRC / đổi ra số cân ở bước 40 không bị tính vào.
+	                #instResponseTimer(IN := TRUE, PT := #RESPONSE_TIMER_PT);
+	                #statResponseTime := #instResponseTimer.ET;
+
+	                // đã nhận đủ 1 gói -> lưu độ dài, chuyển sang phân tích
+	                #statRxLength := #instReceive.LENGTH;
+	                #statState := #ST_PROCESS;
+	            ELSIF #instReceive.ERROR THEN
+	                // CM báo lỗi nhận (parity, framing, tràn bộ đệm...)
+	                #tempErrCode := #ERR_RECEIVE;                         // lỗi 16#8203
+	                #tempSubStatus := #instReceive.STATUS;
+	                #tempRetryable := TRUE;
+	            ELSIF #instTimeout.Q THEN
+	                // hết thời gian mà chưa nhận được gói hoàn chỉnh
+	                #tempErrCode := #ERR_TIMEOUT;                         // lỗi 16#8204
+	                #tempRetryable := TRUE;
+	            END_IF;
+	        END_REGION
+
+	    #ST_PROCESS:
+	        REGION 40 - PROCESS: phân tích gói nhận
+	            #tempLen := UINT_TO_INT(#statRxLength);
+	            #tempRetryable := TRUE;   // mặc định: lỗi gói tin được gửi lại
+
+	            REGION Bước 1 - Kiểm tra độ dài tối thiểu
+	                IF #tempLen < #LEN_MIN_FRAME THEN
+	                    // gói quá ngắn (ngắn hơn cả khung exception 5 byte)
+	                    #tempErrCode := #ERR_FRAME_TOO_SHORT;
+	                    #tempSubStatus := INT_TO_WORD(#tempLen);
+	                ELSIF #tempLen > #RX_BUFFER_SIZE THEN
+	                    // gói dài hơn buffer
+	                    #tempErrCode := #ERR_FRAME_LENGTH;
+	                    #tempSubStatus := INT_TO_WORD(#tempLen);
+	                END_IF;
+	            END_REGION
+
+	            REGION Bước 2 - Kiểm tra CRC gói nhận
+	                // Kiểm tra CRC trước: CRC sai thì mọi byte khác trong gói đều không tin được
+	                IF #tempErrCode = #ERR_NONE THEN
+	                    // --- tính CRC16 MODBUS trên byte 0 .. (len - 3), bỏ 2 byte CRC cuối ---
+	                    #tempCrc := #CRC_INIT;
+	                    FOR #tempIndex := 0 TO #tempLen - 3 DO
+	                        #tempCrc := #tempCrc XOR BYTE_TO_WORD(#statRxBuffer[#tempIndex]);
+	                        FOR #tempBit := 1 TO 8 DO
+	                            IF (#tempCrc AND 16#0001) <> 16#0000 THEN
+	                                #tempCrc := SHR(IN := #tempCrc, N := 1) XOR #CRC_POLY;
+	                            ELSE
+	                                #tempCrc := SHR(IN := #tempCrc, N := 1);
+	                            END_IF;
+	                        END_FOR;
+	                    END_FOR;
+	                    #tempCrcLo := WORD_TO_BYTE(#tempCrc);
+	                    #tempCrcHi := WORD_TO_BYTE(SHR(IN := #tempCrc, N := 8));
+
+	                    // lưu lại để xem khi chẩn đoán, dạng (L H) giống thứ tự trong khung
+	                    #statCrcCalculated := SHL(IN := BYTE_TO_WORD(#tempCrcLo), N := 8) OR BYTE_TO_WORD(#tempCrcHi);
+	                    #statCrcReceived := SHL(IN := BYTE_TO_WORD(#statRxBuffer[#tempLen - 2]), N := 8)
+	                                        OR BYTE_TO_WORD(#statRxBuffer[#tempLen - 1]);
+
+	                    IF #statCrcReceived <> #statCrcCalculated THEN
+	                        // gói bị nhiễu / hỏng trên đường truyền
+	                        #tempErrCode := #ERR_CRC_MISMATCH;
+	                        #tempSubStatus := #statCrcReceived;
+	                    END_IF;
+	                END_IF;
+	            END_REGION
+
+	            REGION Bước 3 - Kiểm tra cấu trúc khung
+	                // Kiểm tra lần lượt, gặp lỗi đầu tiên thì dừng (chuỗi IF..ELSIF).
+	                IF #tempErrCode = #ERR_NONE THEN
+	                    IF #statRxBuffer[0] <> #statTxBuffer[0] THEN
+	                        // địa chỉ trả về phải trùng địa chỉ đã gửi
+	                        #tempErrCode := #ERR_FRAME_ADDRESS;
+	                        #tempSubStatus := BYTE_TO_WORD(#statRxBuffer[0]);
+
+	                    ELSIF #statRxBuffer[1] = #FC_EXCEPTION THEN
+	                        // đầu cân trả exception: không thực hiện được lệnh
+	                        // -> gửi lại cũng vô ích nên không retry
+	                        #tempErrCode := #ERR_EXCEPTION;
+	                        #tempSubStatus := BYTE_TO_WORD(#statRxBuffer[2]);   // mã exception
+	                        #tempRetryable := FALSE;
+
+	                    ELSIF #statRxBuffer[1] <> #FC_READ THEN
+	                        // mã hàm trả về phải là 16#03
+	                        #tempErrCode := #ERR_FRAME_FUNCTION;
+	                        #tempSubStatus := BYTE_TO_WORD(#statRxBuffer[1]);
+
+	                    ELSIF #tempLen <> #LEN_WEIGHT_FRAME THEN
+	                        // khung giá trị cân phải đúng 13 byte
+	                        #tempErrCode := #ERR_FRAME_LENGTH;
+	                        #tempSubStatus := INT_TO_WORD(#tempLen);
+
+	                    ELSIF #statRxBuffer[2] <> #BYTE_COUNT THEN
+	                        // byte [2] = số byte dữ liệu, phải là 8
+	                        #tempErrCode := #ERR_FRAME_BYTE_COUNT;
+	                        #tempSubStatus := BYTE_TO_WORD(#statRxBuffer[2]);
+	                    END_IF;
+	                END_IF;
+	            END_REGION
+
+	            REGION Bước 4 - Tách giá trị cân
+	                IF #tempErrCode = #ERR_NONE THEN
+	                    // từ đây trở đi là lỗi nội dung (gói đúng CRC) -> gửi lại cũng vô ích
+	                    #tempRetryable := FALSE;
+	                    #tempValue := 0;
+	                    #tempNegative := FALSE;
+	                    #tempDigits := 0;
+	                    #tempWeightOk := TRUE;
+	                    #tempBadIndex := 0;
+
+	                    // --- byte [3]: dấu ---
+	                    // Thực tế đầu cân gửi '0' (16#30) khi giá trị dương, '-' (16#2D) khi âm.
+	                    // Vẫn chấp nhận '+' (16#2B, theo manual) và ' ' (16#20) cho chắc.
+	                    IF #statRxBuffer[3] = #CHR_MINUS THEN
+	                        #tempNegative := TRUE;                          // '-' -> giá trị âm
+	                    ELSIF #statRxBuffer[3] <> #CHR_ZERO
+	                        AND #statRxBuffer[3] <> #CHR_PLUS
+	                        AND #statRxBuffer[3] <> #CHR_SPACE
+	                    THEN
+	                        #tempWeightOk := FALSE;                         // không phải '0', '+', '-', ' '
+	                        #tempBadIndex := 3;
+	                    END_IF;
+
+	                    // --- byte [4..9]: 6 chữ số ASCII, Data5 (hàng cao nhất) .. Data0 ---
+	                    // ví dụ "002000" -> 2000
+	                    IF #tempWeightOk THEN
+	                        FOR #tempIndex := 4 TO 9 DO
+	                            #tempCode := BYTE_TO_USINT(#statRxBuffer[#tempIndex]);
+	                            IF #tempCode >= 48 AND #tempCode <= 57 THEN
+	                                // chữ số '0'..'9': ghép vào giá trị (dịch 1 hàng rồi cộng)
+	                                #tempValue := #tempValue * 10 + USINT_TO_DINT(#tempCode - 48);
+	                                #tempDigits := #tempDigits + 1;
+	                            ELSIF #tempCode = 32 AND #tempDigits = 0 THEN
+	                                // khoảng trắng ở đầu -> bỏ qua
+	                                ;
+	                            ELSE
+	                                // ký tự không hợp lệ -> ghi vị trí, dừng đọc
+	                                #tempWeightOk := FALSE;
+	                                #tempBadIndex := #tempIndex;
+	                                EXIT;
+	                            END_IF;
+	                        END_FOR;
+	                    END_IF;
+
+	                    // --- byte [10]: số chữ số thập phân ---
+	                    // manual cho ví dụ dạng ASCII ('2' = 16#32); chấp nhận cả dạng số (16#02)
+	                    #tempCode := BYTE_TO_USINT(#statRxBuffer[10]);
+	                    IF #tempCode >= 48 AND #tempCode <= 57 THEN
+	                        #tempDecimals := #tempCode - 48;                // '0'..'9' -> 0..9
+	                    ELSE
+	                        #tempDecimals := #tempCode;                     // đã là số
+	                    END_IF;
+
+	                    IF NOT #tempWeightOk OR #tempDigits = 0 THEN
+	                        // dấu sai, có ký tự lạ hoặc không có chữ số nào
+	                        #tempErrCode := #ERR_WEIGHT_FORMAT;
+	                        #tempSubStatus := INT_TO_WORD(#tempBadIndex);
+
+	                    ELSIF #tempDecimals > #DECIMALS_MAX THEN
+	                        // số thập phân phải 0..5
+	                        #tempErrCode := #ERR_DECIMAL_FORMAT;
+	                        #tempSubStatus := BYTE_TO_WORD(#statRxBuffer[10]);
+
+	                    ELSIF #tempValue = #OVERLOAD_VALUE THEN
+	                        // đầu cân gửi 999999 khi quá tải
+	                        #tempErrCode := #ERR_WEIGHT_OVERLOAD;
+
+	                    ELSE
+	                        // ===== ĐỌC THÀNH CÔNG =====
+	                        IF #tempNegative THEN
+	                            #tempValue := -#tempValue;
+	                        END_IF;
+	                        #statWeight := #tempValue;          // vd 2000 (không có dấu thập phân)
+	                        #statDecimals := #tempDecimals;     // vd 2    (-> 20.00)
+	                        // weightRaw: chép nguyên 8 byte dữ liệu [3..10] thành chuỗi, vd '00020002'
+	                        Chars_TO_Strg(Chars := #statRxBuffer,
+	                                      pChars := 3,
+	                                      Cnt := 8,
+	                                      Strg => #statWeightRaw);
+	                        #statDone := TRUE;
+	                        #statBusy := FALSE;
+	                        #statError := FALSE;
+	                        #statStatus := #QUALITY_GOOD;
+	                        #statErrorCode := #ERR_NONE;
+	                        #statSubStatus := 16#0000;
+	                        #statState := #ST_IDLE;   // quay về chờ lệnh tiếp theo
+	                    END_IF;
+	                END_IF;
+	            END_REGION
+	        END_REGION
+
+	    ELSE
+	        // statState mang giá trị không có trong danh sách (không bình thường)
+	        #tempErrCode := #ERR_UNDEFINED_STATE;
+	        #tempSubStatus := INT_TO_WORD(#statState);
+	END_CASE;
+
+	REGION Watchdog hết giờ
+	    // FB kẹt ở RX_RESET hoặc SEND quá 'timeout' mà không có DONE/ERROR -> báo lỗi 16#8205,
+	    // hạ REQ của các lệnh để lần chạy lại có sườn lên mới.
+	    IF #tempErrCode = #ERR_NONE AND #instStateWatchdog.Q
+	        AND (#statState = #ST_RX_RESET OR #statState = #ST_SEND)
+	    THEN
+	        #tempErrCode := #ERR_STATE_TIMEOUT;
+	        #tempSubStatus := INT_TO_WORD(#statState);
+	        #tempRetryable := TRUE;
+	        #instRxReset(REQ := FALSE, PORT := #hardwareId);
+	        #instSend(REQ := FALSE, PORT := #hardwareId, BUFFER := #statTxBuffer, LENGTH := #statTxLength);
+	    END_IF;
+	END_REGION
+
+	REGION Xử lý lỗi / retry (dùng chung cho mọi bước)
+	    IF #tempErrCode <> #ERR_NONE THEN
+	        IF #tempRetryable AND #statRetryCounter > 0 THEN
+	            // còn lượt retry -> gửi lại từ bước xóa bộ đệm, chưa báo error ra ngoài
+	            #statRetryCounter := #statRetryCounter - 1;
+	            #instStateWatchdog(IN := FALSE, PT := #timeout);   // reset watchdog
+	            #statStatus := #QUALITY_UNCERTAIN;                  // giá trị chưa được xác nhận
+	            #statState := #ST_RX_RESET;
+	        ELSE
+	            // hết lượt retry hoặc lỗi không cho retry -> báo lỗi ra ngoài
+	            #statDone := FALSE;
+	            #statBusy := FALSE;
+	            #statError := TRUE;
+	            #statStatus := #QUALITY_BAD;
+	            #statErrorCode := #tempErrCode;
+	            #statSubStatus := #tempSubStatus;
+	            #statRestartPending := TRUE;                        // bật chờ tự chạy lại sau restartDelay
+	            #instStateWatchdog(IN := FALSE, PT := #timeout);   // reset watchdog
+	            #statState := #ST_IDLE;
+	        END_IF;
+	    END_IF;
+	END_REGION
+
+	// lưu execute của chu kỳ này để chu kỳ sau bắt sườn lên
+	#statExecuteOld := #tempExecute;
+
+	REGION Ghi output
+	    // ghi từ biến static ra output 1 lần ở cuối khối -> output luôn nhất quán
+	    #done := #statDone;
+	    #busy := #statBusy;
+	    #error := #statError;
+	    #status := #statStatus;
+	    #errorCode := #statErrorCode;
+	    #subStatus := #statSubStatus;
+	    #weight := #statWeight;         // khi lỗi vẫn giữ giá trị đúng gần nhất
+	    #decimals := #statDecimals;
+	    #weightRaw := #statWeightRaw;
+	    #restartCount := #statRestartCount;
+	    #responseTime := #statResponseTime;                    // [V1.1] thời gian phản hồi dạng Time
+	    #responseTimeMs := TIME_TO_DINT(#statResponseTime);   // [V1.1] đổi Time -> số ms (Time lưu nội bộ theo ms)
+	    ENO := NOT #statError;
+	END_REGION
+END_FUNCTION_BLOCK

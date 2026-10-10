@@ -1,0 +1,17 @@
+services:
+  VanAn_Weight:
+    image: nodered/node-red:latest
+    restart: unless-stopped
+    user: "0"
+    environment:
+      - TZ=Asia/Ho_Chi_Minh
+    ports:
+      - "1881:1880"
+    volumes:
+      - ./data:/data
+    # Tự cài các node bổ sung trong data/package.json rồi khởi động Node-RED (cài lỗi vẫn khởi động),
+    # để người tải về chỉ cần chạy "docker compose up -d".
+    entrypoint:
+      - sh
+      - -c
+      - cd /data && npm install --omit=dev --no-audit --no-fund; cd /usr/src/node-red && exec ./entrypoint.sh

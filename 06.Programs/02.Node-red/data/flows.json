@@ -1,0 +1,353 @@
+[
+    {
+        "id": "707f1664494e885f",
+        "type": "tab",
+        "label": "Flow 1",
+        "disabled": false,
+        "info": "",
+        "env": []
+    },
+    {
+        "id": "4fbcfa882626600e",
+        "type": "modbus-client",
+        "name": "S7-1500-master",
+        "clienttype": "tcp",
+        "bufferCommands": true,
+        "stateLogEnabled": false,
+        "queueLogEnabled": false,
+        "failureLogEnabled": true,
+        "tcpHost": "192.168.0.1",
+        "tcpPort": 502,
+        "tcpType": "DEFAULT",
+        "serialPort": "/dev/ttyUSB",
+        "serialType": "RTU-BUFFERD",
+        "serialBaudrate": 9600,
+        "serialDatabits": 8,
+        "serialStopbits": 1,
+        "serialParity": "none",
+        "serialConnectionDelay": 100,
+        "serialAsciiResponseStartDelimiter": "0x3A",
+        "unit_id": 1,
+        "commandDelay": 1,
+        "clientTimeout": 1000,
+        "reconnectOnTimeout": true,
+        "reconnectTimeout": 2000,
+        "parallelUnitIdsAllowed": true,
+        "showErrors": false,
+        "showWarnings": true,
+        "showLogs": true
+    },
+    {
+        "id": "574c255a064974d0",
+        "type": "mqtt-broker",
+        "name": "",
+        "broker": "",
+        "port": 1883,
+        "clientid": "",
+        "autoConnect": true,
+        "usetls": false,
+        "protocolVersion": 4,
+        "keepalive": 60,
+        "cleansession": true,
+        "autoUnsubscribe": true,
+        "birthTopic": "",
+        "birthQos": "0",
+        "birthRetain": "false",
+        "birthPayload": "",
+        "birthMsg": {},
+        "closeTopic": "",
+        "closeQos": "0",
+        "closeRetain": "false",
+        "closePayload": "",
+        "closeMsg": {},
+        "willTopic": "",
+        "willQos": "0",
+        "willRetain": "false",
+        "willPayload": "",
+        "willMsg": {},
+        "userProps": "",
+        "sessionExpiry": ""
+    },
+    {
+        "id": "7bb22aaf9d21f7f0",
+        "type": "mqtt-broker",
+        "name": "",
+        "broker": "host.docker.internal",
+        "port": 1883,
+        "clientid": "VanAn_Weight",
+        "autoConnect": true,
+        "usetls": false,
+        "protocolVersion": 4,
+        "keepalive": 60,
+        "cleansession": true,
+        "autoUnsubscribe": true,
+        "birthTopic": "",
+        "birthQos": "0",
+        "birthRetain": "false",
+        "birthPayload": "",
+        "birthMsg": {},
+        "closeTopic": "",
+        "closeQos": "0",
+        "closeRetain": "false",
+        "closePayload": "",
+        "closeMsg": {},
+        "willTopic": "",
+        "willQos": "0",
+        "willRetain": "false",
+        "willPayload": "",
+        "willMsg": {},
+        "userProps": "",
+        "sessionExpiry": ""
+    },
+    {
+        "id": "cd73dec353154be4",
+        "type": "modbus-read",
+        "z": "707f1664494e885f",
+        "name": "readWeight",
+        "topic": "",
+        "showStatusActivities": true,
+        "logIOActivities": false,
+        "showErrors": true,
+        "showWarnings": true,
+        "unitid": "",
+        "dataType": "HoldingRegister",
+        "adr": "0",
+        "quantity": "4",
+        "rate": "1",
+        "rateUnit": "s",
+        "delayOnStart": false,
+        "enableDeformedMessages": false,
+        "startDelayTime": "",
+        "server": "4fbcfa882626600e",
+        "useIOFile": false,
+        "ioFile": "",
+        "useIOForPayload": false,
+        "emptyMsgOnFail": false,
+        "x": 450,
+        "y": 240,
+        "wires": [
+            [
+                "a1d3464507aaf93c"
+            ],
+            [
+                "d4891be3db391a78"
+            ]
+        ]
+    },
+    {
+        "id": "a1d3464507aaf93c",
+        "type": "debug",
+        "z": "707f1664494e885f",
+        "name": "debug 1",
+        "active": true,
+        "tosidebar": true,
+        "console": true,
+        "tostatus": true,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "payload",
+        "statusType": "auto",
+        "x": 650,
+        "y": 180,
+        "wires": []
+    },
+    {
+        "id": "d4891be3db391a78",
+        "type": "function",
+        "z": "707f1664494e885f",
+        "name": "dataWeight",
+        "func": "const v = msg.payload ?? {};\nconst data = Array.isArray(v) ? v : v.data;\n\n// Cần đủ 3 thanh ghi: hiWord, loWord, errorCode\nif (!Array.isArray(data) || data.length < 3) {\n    return null;\n}\nconst ERROR_TEXT = {\n    //Tham số request Frame sai\n    8101: \"ERR_PARAM_ADDRESS\",\n    8102: \"ERR_PARAM_FUNCTION\",\n    8103: \"ERR_PARAM_REGISTER\",\n    8104: \"ERR_PARAM_QUANTITY\",\n    8105: \"ERR_PARAM_CRC\",\n    //Lỗi truyền thông từ PLC\n    8201: \"ERR_RX_RESET\",\n    8202: \"ERR_SEND\",\n    8203: \"ERR_RECEIVE\",\n    8204: \"ERR_TIMEOUT\",\n    8205: \"ERR_STATE_TIMEOUT\",\n    //Sai Frame nhận\n    8301: \"ERR_FRAME_TOO_SHORT\",\n    8302: \"ERR_FRAME_ADDRESS\",\n    8303: \"ERR_FRAME_FUNCTION\",\n    8304: \"ERR_FRAME_LENGTH\",\n    8305: \"ERR_FRAME_BYTE_COUNT\",\n    //Sai CRC nhận\n    8401: \"ERR_CRC_MISMATCH\",\n    //Đầu cân báo lỗi\n    8501: \"ERR_EXCEPTION\",\n    //Số liệu không hợp lệ\n    8601: \"ERR_WEIGHT_FORMAT\",\n    8602: \"ERR_WEIGHT_OVERLOAD\",\n    8603: \"ERR_DECIMAL_FORMAT\",\n    //Lỗi DB\n    8701: \"ERR_UNDEFINED_STATE\"\n}\nconst hiWord = data[0] & 0xFFFF;   // 400001\nconst loWord = data[1] & 0xFFFF;   // 400002\nconst er = data[2] & 0xFFFF; // 400003\nconst status = data[3]\nconst grossWeight = (hiWord << 16) | loWord;   // DInt có dấu (32-bit)\n\nconst erCode = er.toString(16).toUpperCase().padStart(4, \"0\");  // 400003\nconst erText = ERROR_TEXT [erCode]\nmsg.topic = \"weightKELI\";\nmsg.payload = {\n    weight: grossWeight,\n    error: {\n        Code: erCode,\n        Text: erText\n    }\n};\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 650,
+        "y": 260,
+        "wires": [
+            [
+                "e5498933eb25ea36"
+            ]
+        ]
+    },
+    {
+        "id": "aa6efdb5ab033c3e",
+        "type": "ping",
+        "z": "707f1664494e885f",
+        "protocol": "IPv4",
+        "mode": "timed",
+        "name": "s7-1500",
+        "host": "192.168.0.1",
+        "timer": "5",
+        "inputs": 0,
+        "x": 440,
+        "y": 320,
+        "wires": [
+            [
+                "50bc42fc7b9a5a72"
+            ]
+        ]
+    },
+    {
+        "id": "0362213da65941e1",
+        "type": "ping",
+        "z": "707f1664494e885f",
+        "protocol": "IPv4",
+        "mode": "timed",
+        "name": "remoteIO",
+        "host": "192.168.0.2",
+        "timer": "5",
+        "inputs": 0,
+        "x": 440,
+        "y": 380,
+        "wires": [
+            [
+                "334f8ef3047596da"
+            ]
+        ]
+    },
+    {
+        "id": "e5498933eb25ea36",
+        "type": "join",
+        "z": "707f1664494e885f",
+        "name": "",
+        "mode": "custom",
+        "build": "object",
+        "property": "payload",
+        "propertyType": "msg",
+        "key": "topic",
+        "joiner": "\\n",
+        "joinerType": "str",
+        "useparts": false,
+        "accumulate": true,
+        "timeout": "",
+        "count": "3",
+        "reduceRight": false,
+        "reduceExp": "",
+        "reduceInit": "",
+        "reduceInitType": "",
+        "reduceFixup": "",
+        "x": 870,
+        "y": 320,
+        "wires": [
+            [
+                "3ac024636d33806a",
+                "b06ab3bca4ae7a63"
+            ]
+        ]
+    },
+    {
+        "id": "50bc42fc7b9a5a72",
+        "type": "function",
+        "z": "707f1664494e885f",
+        "name": "ping S7-1500 ",
+        "func": "msg.payload = !!msg.payload //Ghi nhận trạng thái kết nối của hàm ping\nmsg.topic = \"statusPLC\";\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 650,
+        "y": 320,
+        "wires": [
+            [
+                "e5498933eb25ea36"
+            ]
+        ]
+    },
+    {
+        "id": "334f8ef3047596da",
+        "type": "function",
+        "z": "707f1664494e885f",
+        "name": "ping remoteIO",
+        "func": "msg.payload = !!msg.payload //Ghi nhận trạng thái kết nối của hàm ping\nmsg.topic = \"statusIO\";\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 660,
+        "y": 380,
+        "wires": [
+            [
+                "e5498933eb25ea36"
+            ]
+        ]
+    },
+    {
+        "id": "3ac024636d33806a",
+        "type": "debug",
+        "z": "707f1664494e885f",
+        "name": "debug 2",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": true,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "payload",
+        "statusType": "msg",
+        "x": 1080,
+        "y": 400,
+        "wires": []
+    },
+    {
+        "id": "5804edc90a95e9ca",
+        "type": "mqtt out",
+        "z": "707f1664494e885f",
+        "name": "pub-data-weight",
+        "topic": "",
+        "qos": "0",
+        "retain": "false",
+        "respTopic": "",
+        "contentType": "",
+        "userProps": "",
+        "correl": "",
+        "expiry": "",
+        "broker": "7bb22aaf9d21f7f0",
+        "x": 1320,
+        "y": 320,
+        "wires": []
+    },
+    {
+        "id": "b06ab3bca4ae7a63",
+        "type": "function",
+        "z": "707f1664494e885f",
+        "name": "function 1",
+        "func": "let base =\"VANAN_weight/pub\"\nconst p = msg.payload ?? {}\n\nlet data = {\n    weight: p.weightKELI.weight,\n    error: {\n        erCode: p.weightKELI?.error?.Code,\n        erText: p.weightKELI?.error?.Text\n    },\n    statusPLC: p.statusPLC,\n    statusIO: p.statusIO,\n    timestamp: new Date().toISOString()\n}\n\nlet msgs = []\n\nfor (let key in data) {\n    msgs.push({\n        topic: base + \"/\" + key,\n        payload: data[key]\n    })\n}\n\nreturn [msgs];",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1080,
+        "y": 320,
+        "wires": [
+            [
+                "5804edc90a95e9ca",
+                "3e8f0f01f71ff92a"
+            ]
+        ]
+    },
+    {
+        "id": "3e8f0f01f71ff92a",
+        "type": "debug",
+        "z": "707f1664494e885f",
+        "name": "debug 3",
+        "active": true,
+        "tosidebar": true,
+        "console": true,
+        "tostatus": true,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "payload",
+        "statusType": "msg",
+        "x": 1310,
+        "y": 400,
+        "wires": []
+    }
+]

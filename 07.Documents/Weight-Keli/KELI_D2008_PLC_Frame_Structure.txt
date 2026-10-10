@@ -1,0 +1,359 @@
+﻿KELI D2008 – CẤU TRÚC TRUYỀN NHẬN GIỮA PLC VÀ ĐẦU CÂN
+==========================================================
+
+1. PHẠM VI
+----------
+PLC: Siemens S7-1200 / S7-1500
+Thiết bị: Đầu cân KELI D2008
+Chế độ đầu cân: TF = 1 (MODBUS command)
+Cổng PLC: RS485 qua module CM/ET200SP CM PtP
+Cách xử lý PLC: Send_P2P / Receive_P2P (Freeport)
+
+Cấu hình truyền thông đang sử dụng:
+- Slave Address: 02
+- Baud rate: 9600 bps
+- Data bits: 8
+- Parity: None
+- Stop bit: 1
+
+Lưu ý:
+Frame thực tế của KELI ở chế độ này được truyền dưới dạng byte và kiểm tra CRC16 MODBUS.
+Các trường Sign, Weight Data và Decimal bên trong vùng dữ liệu phản hồi được mã hóa ASCII.
+
+
+2. LUỒNG TRUYỀN THÔNG
+---------------------
+PLC                         KELI D2008
+ |                              |
+ |--- Request Read Gross ------>|
+ |                              |
+ |<-- Response Gross Weight ----|
+ |                              |
+
+PLC thực hiện:
+1) Gửi frame yêu cầu đọc Gross Weight.
+2) Chờ KELI phản hồi.
+3) Kiểm tra Slave Address.
+4) Kiểm tra Function Code.
+5) Kiểm tra Byte Count.
+6) Kiểm tra chiều dài frame.
+7) Kiểm tra CRC16.
+8) Giải mã Sign ASCII.
+9) Giải mã 6 byte Weight Data ASCII.
+10) Giải mã Decimal ASCII.
+11) Ghép thành giá trị Gross Weight.
+
+
+3. FRAME PLC GỬI ĐẾN KELI – READ GROSS WEIGHT
+----------------------------------------------
+Frame thực tế:
+
+02 03 00 01 00 04 15 FA
+
+Tổng chiều dài: 8 byte
+
+Cấu trúc:
+
+Byte    Giá trị    Ý nghĩa
+----    -------    --------------------------------
+[0]     02         Slave Address
+[1]     03         Function Code – Read
+[2]     00         Starting Address High
+[3]     01         Starting Address Low
+[4]     00         Quantity High
+[5]     04         Quantity Low
+[6]     15         CRC Low
+[7]     FA         CRC High
+
+Phân nhóm:
+
+02 | 03 | 00 01 | 00 04 | 15 FA
+ |    |      |       |       |
+ |    |      |       |       +-- CRC16 (Low, High)
+ |    |      |       +---------- Đọc 4 registers
+ |    |      +------------------ Gross Weight register = 0001
+ |    +------------------------- Function 03
+ +------------------------------ Slave Address = 02
+
+
+4. FRAME KELI PHẢN HỒI
+----------------------
+Frame thực tế:
+
+02 03 08 30 30 30 30 30 33 30 30 07 6B
+
+Tổng chiều dài: 13 byte
+
+Cấu trúc:
+
+Byte    Giá trị    Ý nghĩa
+----    -------    ----------------------------------------
+[0]     02         Slave Address
+[1]     03         Function Code
+[2]     08         Byte Count = 8 byte dữ liệu
+[3]     30         Sign – ASCII
+[4]     30         Weight Data5 – ASCII
+[5]     30         Weight Data4 – ASCII
+[6]     30         Weight Data3 – ASCII
+[7]     30         Weight Data2 – ASCII
+[8]     33         Weight Data1 – ASCII
+[9]     30         Weight Data0 – ASCII
+[10]    30         Decimal – ASCII
+[11]    07         CRC Low
+[12]    6B         CRC High
+
+Phân nhóm:
+
+02 | 03 | 08 | 30 | 30 30 30 30 33 30 | 30 | 07 6B
+ |    |    |    |            |             |      |
+ |    |    |    |            |             |      +-- CRC16
+ |    |    |    |            |             +--------- Decimal ASCII
+ |    |    |    |            +----------------------- 6 Weight Data ASCII
+ |    |    |    +------------------------------------ Sign ASCII
+ |    |    +----------------------------------------- Byte Count = 8
+ |    +---------------------------------------------- Function 03
+ +--------------------------------------------------- Slave Address 02
+
+
+5. VÙNG DATA 8 BYTE CỦA KELI
+----------------------------
+Byte Count = 08 nghĩa là sau byte [2] có 8 byte dữ liệu:
+
+[3] Sign
+[4] Weight Data5
+[5] Weight Data4
+[6] Weight Data3
+[7] Weight Data2
+[8] Weight Data1
+[9] Weight Data0
+[10] Decimal
+
+Tức là:
+
+1 byte Sign ASCII
++ 6 byte Weight Data ASCII
++ 1 byte Decimal ASCII
+= 8 byte Data
+
+
+6. GIẢI MÃ SIGN ASCII
+---------------------
+Frame thực tế:
+
+Sign = 16#30
+
+16#30 là ký tự ASCII '0'.
+
+Theo dữ liệu thực tế đang sử dụng:
+- ASCII '0' (16#30): giá trị dương
+- ASCII '-' (16#2D): giá trị âm
+
+PLC phải xử lý byte [3] như một ký tự ASCII, không phải giá trị số của khối lượng.
+
+
+7. GIẢI MÃ WEIGHT DATA ASCII
+-----------------------------
+6 byte Weight Data thực tế:
+
+30 30 30 30 33 30
+
+Chuyển HEX ASCII sang ký tự:
+
+16#30 -> '0'
+16#30 -> '0'
+16#30 -> '0'
+16#30 -> '0'
+16#33 -> '3'
+16#30 -> '0'
+
+Chuỗi Weight:
+
+"000030"
+
+Chuyển chuỗi số ASCII sang DINT:
+
+000030 -> 30
+
+Nguyên lý PLC:
+
+Value = 0
+
+Mỗi ký tự:
+Digit = ASCII_Code - 16#30
+Value = Value * 10 + Digit
+
+Sau 6 byte:
+
+Value = 30
+
+
+8. GIẢI MÃ DECIMAL ASCII
+------------------------
+Byte Decimal thực tế:
+
+[10] = 16#30
+
+Đây là ASCII '0':
+
+16#30 -> '0' -> 0 chữ số thập phân
+
+Bảng quy đổi:
+
+HEX     ASCII    Decimal
+----    -----    -------
+30      '0'      0
+31      '1'      1
+32      '2'      2
+33      '3'      3
+34      '4'      4
+35      '5'      5
+
+PLC nên kiểm tra Decimal dưới dạng ASCII.
+
+Công thức giá trị kỹ thuật:
+
+Gross Weight = Signed_Integer_Weight / (10 ^ Decimal)
+
+Ví dụ frame hiện tại:
+
+Weight Data = "000030" -> 30
+Decimal     = '0'      -> 0
+Sign        = '0'      -> Positive
+
+Gross Weight = +30 / 10^0
+             = +30 kg
+
+
+9. KIỂM TRA CRC16
+-----------------
+CRC16 MODBUS:
+- Initial value: 16#FFFF
+- Polynomial: 16#A001
+- Tính CRC trên toàn bộ frame ngoại trừ 2 byte CRC cuối.
+- Truyền CRC Low trước, CRC High sau.
+
+Request:
+
+02 03 00 01 00 04 | 15 FA
+                    CRC L/H
+
+Response:
+
+02 03 08 30 30 30 30 30 33 30 30 | 07 6B
+                                      CRC L/H
+
+Với response thực tế:
+- CRC Low  = 07
+- CRC High = 6B
+
+
+10. TRÌNH TỰ XỬ LÝ TRONG PLC
+-----------------------------
+START
+  |
+  v
+Reset Receive Buffer
+  |
+  v
+Gửi Request
+02 03 00 01 00 04 15 FA
+  |
+  v
+Chờ Receive_P2P
+  |
+  v
+Nhận Frame
+02 03 08 30 30 30 30 30 33 30 30 07 6B
+  |
+  v
+Kiểm tra Length = 13 byte
+  |
+  v
+Kiểm tra Slave Address = 02
+  |
+  v
+Kiểm tra Function = 03
+  |
+  v
+Kiểm tra Byte Count = 08
+  |
+  v
+Kiểm tra CRC16
+  |
+  v
+Đọc Sign ASCII [3]
+  |
+  v
+Đọc Weight ASCII [4..9]
+  |
+  v
+ASCII -> DINT
+  |
+  v
+Đọc Decimal ASCII [10]
+  |
+  v
+ASCII -> Decimal
+  |
+  v
+Áp dụng dấu và vị trí thập phân
+  |
+  v
+Gross Weight
+  |
+  v
+DONE
+
+
+11. MAP BUFFER PLC
+------------------
+RX Buffer:
+
+Index    Nội dung
+-----    ----------------------------
+0        Slave Address
+1        Function Code
+2        Byte Count
+3        Sign ASCII
+4        Weight Data5 ASCII
+5        Weight Data4 ASCII
+6        Weight Data3 ASCII
+7        Weight Data2 ASCII
+8        Weight Data1 ASCII
+9        Weight Data0 ASCII
+10       Decimal ASCII
+11       CRC Low
+12       CRC High
+
+
+12. FRAME LỖI / EXCEPTION
+-------------------------
+Theo cấu trúc đang dùng trong chương trình:
+
+[0] Slave Address
+[1] 16#83
+[2] Exception Code
+[3] CRC Low
+[4] CRC High
+
+Tổng chiều dài: 5 byte.
+
+
+13. TÓM TẮT
+-----------
+REQUEST:
+02 03 00 01 00 04 15 FA
+Length = 8 byte
+
+RESPONSE:
+02 03 08 30 30 30 30 30 33 30 30 07 6B
+Length = 13 byte
+
+DATA:
+Sign        = 30 HEX = ASCII '0' = Positive
+Weight Data = 30 30 30 30 33 30 = ASCII "000030"
+Decimal     = 30 HEX = ASCII '0' = 0 decimal places
+CRC         = 07 6B
+
+RESULT:
+Gross Weight = +30 kg

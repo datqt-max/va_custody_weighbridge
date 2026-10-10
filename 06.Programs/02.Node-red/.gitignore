@@ -1,0 +1,8 @@
+data/flows_cred.json
+data/.config.*.json
+data/node_modules/
+data/.npm/
+data/lib/
+data/*.backup
+data/.flows*.json.backup
+nodered-backup/

@@ -1,0 +1,6 @@
+# TIA Portal - file tạm/cache
+**/IM/
+**/XRef/
+**/Logs/
+**/~*
+*.backup/
